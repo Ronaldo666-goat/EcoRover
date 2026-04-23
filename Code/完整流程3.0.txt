@@ -1,0 +1,630 @@
+#include <Wire.h>
+#include "Adafruit_TCS34725.h"
+
+// ==========================================
+// 1. 硬件引脚定义 (底盘 + 传感器)
+// ==========================================
+#define ENA 5
+#define ENB 6
+#define IN1 3
+#define IN2 4
+#define IN3 2
+#define IN4 7
+
+#define PIN_S1 8
+#define PIN_S2 9
+#define PIN_S3 10
+#define PIN_S4 11
+
+#define TrigSide 25
+#define EchoSide 24
+
+// ==========================================
+// 2. 机械臂与颜色仓储记忆系统
+// ==========================================
+enum ColorType { UNKNOWN, RED_OBJ, YELLOW_OBJ, BLUE_OBJ, BLACK_OBJ, WHITE_OBJ };
+ColorType storageBins[3] = {UNKNOWN, UNKNOWN, UNKNOWN}; // 3个装载仓位
+
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_24MS, TCS34725_GAIN_4X);
+// 颜色基准坐标
+int ref_Red[3]        = {105,  85,  65};
+int ref_Yellow[3]     = {95,  100,  52};
+int ref_Blue[3]       = { 55,  92, 115};
+
+int WHITE_C_MIN  = 500;
+int BLACK_C_MAX  = 100;
+
+// ==========================================
+// 3. AGV 调度与状态机核心变量
+// ==========================================
+enum SystemMode { 
+  MODE_GOTO_TRASH_ZONE, 
+  MODE_HUNTING,         
+  MODE_GOTO_RECYCLE,    
+  MODE_DELIVERING,      
+  MODE_RETURN_BASE      
+};
+SystemMode currentMode = MODE_GOTO_TRASH_ZONE;
+
+int garbageCount = 0; 
+int outboundStep = 0;       
+int inboundStep = 0;
+int crossJunctionCount = 0;
+int returnNodesToSkip = 0; 
+
+// ==========================================
+// 4. 速度与时间参数
+// ==========================================
+int speedRun  = 130;  
+int speedTurn = 200;
+int timeBack  = 500; 
+
+void broadcastToPhone(String message) {
+  Serial2.println(message); 
+  Serial.println(message);
+}
+
+// ==========================================
+// 5. 初始化 Setup
+// ==========================================
+void setup() {
+  Serial.begin(9600);       
+  Serial1.begin(115200);    
+  Serial2.begin(9600);
+  
+  pinMode(ENA, OUTPUT); pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(PIN_S1, INPUT); pinMode(PIN_S2, INPUT);
+  pinMode(PIN_S3, INPUT); pinMode(PIN_S4, INPUT);
+  
+  pinMode(TrigSide, OUTPUT); pinMode(EchoSide, INPUT);
+
+  if (tcs.begin()) { 
+    broadcastToPhone("✅ [系统] 颜色传感器已就绪！");
+  } else {
+    broadcastToPhone("❌ [系统] 找不到TCS34725，请检查接线！");
+    while (1);
+  }
+
+  stopCar();
+  delay(3000); 
+  broadcastToPhone("🚀 满仓寻宝任务启动，离开基地！");
+}
+
+// ==========================================
+// 6. 主循环 Loop
+// ==========================================
+void loop() {
+  int nodeType = checkIntersection();
+  if (nodeType > 0) {
+    handleIntersection(nodeType); 
+    return;
+  }
+
+  switch (currentMode) {
+    case MODE_GOTO_TRASH_ZONE:
+    case MODE_GOTO_RECYCLE:
+    case MODE_DELIVERING:
+    case MODE_RETURN_BASE:
+      runLineTrackingOnly();
+      break;
+
+    case MODE_HUNTING:
+      // ★ 核心修改：如果仓位没满(<3)且遇到障碍物，才停下来抓
+      if (garbageCount < 3 && checkSideObstacle()) {
+        executeRealGrab();
+      } 
+      // ★ 如果仓满了(>=3)，或者没遇到障碍物，就一律无视，踩油门直奔死胡同尽头！
+      else {
+        runLineTrackingOnly();
+      }
+      break;
+  }
+}
+
+// ==========================================
+// 7. 真实机械臂抓取流程 
+// ==========================================
+void executeRealGrab() {
+  stopCar(); delay(100);
+  broadcastToPhone("⚙️ [寻宝] 发现侧方目标！微调倒退对准...");
+  runBackward(); delay(timeBack); stopCar(); delay(400); 
+  
+  broadcastToPhone("🦾 [机械臂] 开始抓取并送往扫描区...");
+  sendGrabAndScanCommand(); 
+  
+  broadcastToPhone("🔎 [颜色] 开始识别...");
+  ColorType finalColor = UNKNOWN;
+  for (int i = 0; i < 3; i++) {
+    finalColor = identifyColor();
+    if (finalColor != UNKNOWN) break; 
+    delay(300);
+  }
+  printColorName(finalColor);
+  
+  if (finalColor != UNKNOWN) {
+    int emptyBinIndex = -1;
+    for (int i = 0; i < 3; i++) {
+      if (storageBins[i] == UNKNOWN) {
+        emptyBinIndex = i;
+        break;
+      }
+    }
+
+    if (emptyBinIndex != -1) {
+      broadcastToPhone("📦 [入仓] 找到空仓位: " + String(emptyBinIndex) + "号");
+      sendStoreCommandToSlave(emptyBinIndex);
+      storageBins[emptyBinIndex] = finalColor; 
+      garbageCount++; 
+      printStorageMemory();
+    } else {
+      broadcastToPhone("⚠️ [警告] 仓位已满！执行抛弃动作...");
+      Serial1.println("X 90; delay 1000; Y 90; delay 1000; E -20; delay 500; H;");
+      delay(10000);
+    }
+  } else {
+    broadcastToPhone("🗑️ [丢弃] 未知物品，直接丢弃...");
+    Serial1.println("X 90; delay 1000; E -20; delay 500; H;");
+    delay(5000);
+  }
+  
+  broadcastToPhone("🛣️ [导航] 正在循迹驶离当前障碍物区域...");
+  unsigned long passTime = millis();
+  while (millis() - passTime < 400) {
+    runLineTrackingOnly(); 
+  }
+  stopCar(); delay(100);
+}
+
+// ==========================================
+// 8. ★极致优化的直线流水线派送系统★
+// ==========================================
+bool hasColorInBins(ColorType targetColor) {
+  for (int i = 0; i < 3; i++) {
+    if (storageBins[i] == targetColor) return true;
+  }
+  return false;
+}
+
+void unloadSpecificColor(ColorType targetColor) {
+  int targetBinIndex = -1;
+  for(int i = 0; i < 3; i++) {
+    if (storageBins[i] == targetColor) {
+      targetBinIndex = i;
+      break;
+    }
+  }
+
+  if (targetBinIndex != -1) {
+    broadcastToPhone("🦾 [卸货] 正在从仓位 " + String(targetBinIndex) + " 卸下对应方块...");
+    if (targetBinIndex == 0) {
+      Serial1.println("X 64; delay 500; E 25; delay 500; Y 107; delay 500; Z 160; delay 500; E 60; delay 500; Z 180; delay 500; Y 55; delay 500; X 180; delay 500; Y 90; delay 500; Y 162; delay 500; Z 125; delay 500; E 0; delay 500; Z 180; delay 500; Y 55; delay 500; E 85; delay 500; X 90; delay 500");
+    } else if (targetBinIndex == 1) {
+      Serial1.println("X 90; delay 500; E 25; delay 500; Y 125; delay 500; Z 165; delay 500; E 60; delay 500; Z 180; delay 500; Y 55; delay 500; X 180; delay 500; Y 90; delay 500; Y 162; delay 500; Z 125; delay 500; E 0; delay 500; Z 180; delay 500; Y 55; delay 500; E 85; delay 500; X 90; delay 500");
+    } else if (targetBinIndex == 2) {
+      Serial1.println("X 118; delay 500; E 25; delay 500; Y 97; delay 500; Z 160; delay 500; E 60; delay 500; Z 180; delay 500; Y 55; delay 500; X 180; delay 500; Y 90; delay 500; Y 162; delay 500; Z 125; delay 500; E 0; delay 500; Z 180; delay 500; Y 55; delay 500; E 85; delay 500; X 90; delay 500");
+    }
+    delay(20000); 
+    storageBins[targetBinIndex] = UNKNOWN; 
+    garbageCount--; 
+    printStorageMemory();
+  }
+}
+
+// 辅助函数：专门处理分支内的作业 (循迹到底 -> 抽搐掉头 -> 卸货 -> 出来停在主路口)
+void processBranchInside(ColorType targetColor) {
+  broadcastToPhone("⏩ [投递] 驶向分支尽头...");
+  unsigned long t0 = millis();
+  while (true) {
+    runLineTrackingOnly();
+    if (millis() - t0 > 1000) { 
+      if (digitalRead(PIN_S2) == HIGH && digitalRead(PIN_S3) == HIGH) break;
+    }
+  }
+  stopCar(); delay(200);
+
+  broadcastToPhone("🎯 [投递] 到达尽头！直接 180度抽搐掉头...");
+  turnAround180(); 
+
+  broadcastToPhone("🎯 [投递] 正在进行投递前姿态微调...");
+  analogWrite(ENA, speedTurn); analogWrite(ENB, speedTurn);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); 
+  while (digitalRead(PIN_S2) == LOW) {} 
+  
+  stopCar(); delay(300);
+
+  broadcastToPhone("📦 [投递] 掉头完毕！准备卸货...");
+  unloadSpecificColor(targetColor);
+
+  broadcastToPhone("🔙 [投递] 卸货完毕，循迹返回主路...");
+  runForward(); delay(20); // 盲走脱出尽头线
+  t0 = millis();
+  while (true) {
+    runLineTrackingOnly();
+    if (millis() - t0 > 1000) { 
+      int node = checkIntersection();
+      if (node == 1 || node == 2 || node == 3) break; 
+    }
+  }
+  stopCar(); delay(200);
+}
+
+// 核心智能路口处理器
+void processJunction(int junctionNum) {
+  // ★ 严格匹配你要求的映射：左边黄色，右边红色
+  ColorType leftColor  = (junctionNum == 1) ? YELLOW_OBJ : BLACK_OBJ;
+  ColorType rightColor = (junctionNum == 1) ? RED_OBJ    : BLUE_OBJ;
+
+  bool needLeft = hasColorInBins(leftColor);
+  bool needRight = hasColorInBins(rightColor);
+
+  if (!needLeft && !needRight) return; // 没货直接返回，不影响方向
+
+  if (needLeft && !needRight) {
+    // --- 只有黄色 (仅左侧) ---
+    broadcastToPhone("🔄 [投递] 仅左侧：左拐进入...");
+    alignAndTurnLeft_Cross(); // ★ 完美对正中心后左拐
+    
+    processBranchInside(leftColor); // 出来时车头天然朝右
+
+    if (garbageCount == 0) {
+      broadcastToPhone("🔙 [卸货] 空车！(天然朝右) 直接右拐提前返航！");
+      alignAndTurnRight_Cross(); // ★ 完美对正中心后右拐，刚好面向家
+    } else {
+      broadcastToPhone("⏩ [卸货] 还有货，左拐恢复直行前往下一站！");
+      alignAndTurnLeft_Cross(); // ★ 完美对正中心后左拐，恢复前方
+    }
+  }
+  else if (!needLeft && needRight) {
+    // --- 只有红色 (仅右侧) ---
+    broadcastToPhone("🔄 [投递] 仅右侧：右拐进入...");
+    alignAndTurnRight_Cross(); // ★ 完美对正中心后右拐
+    
+    processBranchInside(rightColor); // 出来时车头天然朝左
+
+    if (garbageCount == 0) {
+      broadcastToPhone("🔙 [卸货] 空车！(天然朝左) 直接左拐提前返航！");
+      alignAndTurnLeft_Cross(); // ★ 完美对正中心后左拐，刚好面向家
+    } else {
+      broadcastToPhone("⏩ [卸货] 还有货，右拐恢复直行前往下一站！");
+      alignAndTurnRight_Cross(); // ★ 完美对正中心后右拐，恢复前方
+    }
+  }
+  else if (needLeft && needRight) {
+    // --- 黄红都有 (终极丝滑派送) ---
+    broadcastToPhone("🔄 [投递] 先左拐进入黄色区...");
+    alignAndTurnLeft_Cross(); // ★ 完美对正中心后左拐
+    processBranchInside(leftColor); // 出来时车头天然朝右 (正好对准红色区)
+
+    broadcastToPhone("⏩ [投递] 左侧卸完，直接跨主路直行进入红色区！");
+    driveStraightOverNode(); // 不拐弯！直接开过黑线进对门！
+    
+    processBranchInside(rightColor); // 从红色区出来时，车头天然朝左
+
+    if (garbageCount == 0) {
+      broadcastToPhone("🔙 [卸货] 皆已清空！(天然朝左) 直接左拐提前返航！");
+      alignAndTurnLeft_Cross(); // ★ 完美对正中心后左拐，刚好面向家
+    } else {
+      broadcastToPhone("⏩ [卸货] 还有货，右拐恢复直行前往下一站！");
+      alignAndTurnRight_Cross(); // ★ 完美对正中心后右拐，恢复前方
+    }
+  }
+}
+
+// ==========================================
+// 9. 机械臂通信指令与颜色算法
+// ==========================================
+void sendGrabAndScanCommand() {
+  Serial1.println("E 0; delay 1000; Y 55; delay 500; X 180; delay 1000; Y 162; delay 1000; Z 125; delay 1000; E 60; delay 1000; Z 180; delay 1000; Y 55; delay 1000;");
+  delay(15000); 
+}
+
+void sendStoreCommandToSlave(int binIndex) {
+  if (binIndex == 0) {
+    Serial1.println("X 64; delay 1000; Y 107; delay 500; Z 180; delay 500; Z 160; delay 500; E 25; delay 500; Z 180; delay 500; Y 55; delay 500; X 90; delay 500;");
+  } else if (binIndex == 1) {
+    Serial1.println("X 90; delay 1000; Y 125; delay 500; Z 180; delay 500; Z 165; delay 500; E 25; delay 500; Z 180; delay 500; Y 55; delay 500; X 90; delay 500;");
+  } else if (binIndex == 2) {
+    Serial1.println("X 118; delay 1000; Y 97; delay 500; Z 180; delay 500; Z 160; delay 500; E 25; delay 500; Z 180; delay 500; Y 55; delay 500; X 90; delay 500;");
+  }
+  delay(15000); 
+  broadcastToPhone("<<< 放置完成，继续循迹！");
+}
+
+ColorType identifyColor() {
+  uint16_t r, g, b, c;
+  tcs.getRawData(&r, &g, &b, &c);
+  if (c == 0) return UNKNOWN;
+  if (c > WHITE_C_MIN) return WHITE_OBJ;
+  if (c <= BLACK_C_MAX) return BLACK_OBJ;
+  int red   = map(r, 0, c, 0, 255); 
+  int green = map(g, 0, c, 0, 255);
+  int blue  = map(b, 0, c, 0, 255);
+
+  long distRed    = sq(red - ref_Red[0])    + sq(green - ref_Red[1])    + sq(blue - ref_Red[2]);
+  long distYellow = sq(red - ref_Yellow[0]) + sq(green - ref_Yellow[1]) + sq(blue - ref_Yellow[2]);
+  long distBlue   = sq(red - ref_Blue[0])   + sq(green - ref_Blue[1])   + sq(blue - ref_Blue[2]);
+  long minDist = distRed; 
+  ColorType result = RED_OBJ;
+
+  if (distYellow < minDist) { minDist = distYellow; result = YELLOW_OBJ; } 
+  if (distBlue < minDist)   { minDist = distBlue;   result = BLUE_OBJ; } 
+
+  if (minDist > 10000) return UNKNOWN; 
+  return result;
+}
+
+void printColorName(ColorType color) {
+  switch (color) {
+    case RED_OBJ:    broadcastToPhone("🔴 判定：红色"); break;
+    case YELLOW_OBJ: broadcastToPhone("🟡 判定：黄色"); break;
+    case BLUE_OBJ:   broadcastToPhone("🔵 判定：蓝色"); break;
+    case BLACK_OBJ:  broadcastToPhone("⚫ 判定：黑色"); break;
+    case WHITE_OBJ:  broadcastToPhone("⚪ 判定：白色"); break;
+    case UNKNOWN:    broadcastToPhone("❓ 判定：未知"); break;
+  }
+}
+
+void printStorageMemory() {
+  Serial.print("[仓储记忆] 0号:");
+  if(storageBins[0]==UNKNOWN) Serial.print("空 "); else Serial.print("满 ");
+  Serial.print(" 1号:"); 
+  if(storageBins[1]==UNKNOWN) Serial.print("空 "); else Serial.print("满 ");
+  Serial.print(" 2号:"); 
+  if(storageBins[2]==UNKNOWN) Serial.println("空 "); else Serial.println("满 ");
+}
+
+// ==========================================
+// 10. 拓扑导航系统大脑
+// ==========================================
+int checkIntersection() {
+  bool leftHit = digitalRead(PIN_S1);
+  bool rightHit = digitalRead(PIN_S4);
+  if (leftHit && rightHit) return 1; 
+  if (leftHit && !rightHit) return 2;
+  if (!leftHit && rightHit) return 3; 
+  return 0;
+}
+
+void handleIntersection(int nodeType) {
+  stopCar(); delay(100);
+  
+  if (currentMode == MODE_GOTO_TRASH_ZONE) {
+    if (nodeType == 2 || nodeType == 1) { 
+      outboundStep++;
+      if (outboundStep == 1) {
+        broadcastToPhone("📍 [导航] 第1个路口N1 -> 跨越直行");
+        driveStraightOverNode();
+        currentMode = MODE_HUNTING;
+      }
+    }
+  } 
+  else if (currentMode == MODE_HUNTING) {
+    if (nodeType == 2) {
+      broadcastToPhone("🔄 [寻宝] 遇到垃圾区弯道 -> 左拐");
+      alignAndTurnLeft_Curve(); 
+    } else if (nodeType == 1) { 
+      broadcastToPhone("⛔ [寻宝] 死胡同尽头 -> 强制调头");
+      alignAndTurnAround();     
+      driveStraightOverNode(); // 掉头后跨出盲区
+      inboundStep = 0; 
+      currentMode = MODE_GOTO_RECYCLE;
+    }
+  }
+  else if (currentMode == MODE_GOTO_RECYCLE) {
+    if (nodeType == 3 || nodeType == 1) { 
+      inboundStep++;
+      if (inboundStep == 1) {
+        broadcastToPhone("🔙 [返程] 第0步：掉头调整");
+        alignAndTurnRight_Curve(); 
+      } 
+      if (inboundStep == 2) {
+        broadcastToPhone("🔙 [返程] 第1步：退出弯道 -> 右拐");
+        alignAndTurnRight_Curve(); // ★ 调用普通细线弯道转弯
+      } 
+      else if (inboundStep == 3) {
+        broadcastToPhone("📍 [导航] 第2步：回到主干道 -> 右拐进回收区！");
+        alignAndTurnRight_Cross(); // ★ 这里是回主干道的十字路口，用粗线盲转
+        currentMode = MODE_DELIVERING; 
+      }
+    }
+  }
+  
+  else if (currentMode == MODE_DELIVERING) {
+    if (nodeType == 1 || nodeType == 2 || nodeType == 3) { 
+      crossJunctionCount++;
+      broadcastToPhone("🚚 [卸货] 到达回收区第 " + String(crossJunctionCount) + " 个路口/站点");
+      
+      if (crossJunctionCount == 1) {
+        processJunction(1);
+      } else if (crossJunctionCount == 2) {
+        processJunction(2);
+      } 
+      else if (crossJunctionCount == 3) {
+        broadcastToPhone("🎯 [投递] 到达主路尽头 (白色回收站)！");
+        if (hasColorInBins(WHITE_OBJ)) {
+           turnAround180();
+           unloadSpecificColor(WHITE_OBJ);
+        } else {
+           turnAround180();
+        }
+        broadcastToPhone("✅ [卸货] 所有投递结束！准备返回基地！");
+        returnNodesToSkip = crossJunctionCount - 1; 
+        driveStraightOverNode();
+        currentMode = MODE_RETURN_BASE;
+        return;
+      }
+
+      // 无论刚才经历了什么分流，最终检查车里是否空了
+      if (garbageCount == 0) {
+        broadcastToPhone("✅ [卸货] 货已空，且已自动面朝返航方向！");
+        returnNodesToSkip = crossJunctionCount - 1; 
+        driveStraightOverNode(); 
+        currentMode = MODE_RETURN_BASE;
+      } else {
+        broadcastToPhone("⏩ [导航] 还有货，继续跨越前往下一站...");
+        driveStraightOverNode();
+      }
+    }
+  }
+  
+  else if (currentMode == MODE_RETURN_BASE) {
+    if (nodeType == 1 || nodeType == 2 || nodeType == 3) {
+       // 如果深处有路口还没跨完，就跳过它
+       if (returnNodesToSkip > 0) {
+           broadcastToPhone("⏩ [返程] 跨过已作业的路口...");
+           driveStraightOverNode();
+           returnNodesToSkip--;
+       } else {
+           // 跳完了，这个路口就是 N1，右拐准备回家！
+           broadcastToPhone("🏠 [导航] 回到 N1 主路口 -> 右拐准备回基地！");
+           alignAndTurnRight_Curve();
+           
+           broadcastToPhone("🚗 [入库] 正在循迹驶向车库...");
+           
+           // 1. 刚拐完弯，探头可能还在 N1 的粗黑线上。先强制盲走一小段脱离 N1 路口！
+           runForward(); 
+           delay(300); 
+           
+           // 2. 进入循迹死循环，只有到了基地才会打破
+           while (true) {
+               runLineTrackingOnly(); // 调用底层的双探头柔性循迹
+               
+               // 3. 检测是否 4 个探头都踩到了黑线 (HIGH)
+               if (digitalRead(PIN_S1) == HIGH && digitalRead(PIN_S2) == HIGH && 
+                   digitalRead(PIN_S3) == HIGH && digitalRead(PIN_S4) == HIGH) {
+                   break; // 到达基地停车线，跳出循环！
+               }
+           }
+           
+           // 4. 到达基地后的刹车动作
+           broadcastToPhone("🎉 [入库] 到达基地！测试圆满结束！");
+           runBackward(); delay(200); // 稍微往前再开一点，让车身完美停在停车框内
+           stopCar(); 
+           while(1); // 永久停车，任务结束
+       }
+    }
+  }
+}
+
+// ==========================================
+// 11. 障碍物检测
+// ==========================================
+float GetDistance() {
+  digitalWrite(TrigSide, LOW); delayMicroseconds(2);
+  digitalWrite(TrigSide, HIGH); delayMicroseconds(10);
+  digitalWrite(TrigSide, LOW);
+  float duration = pulseIn(EchoSide, HIGH, 30000); 
+  if (duration == 0) return 999; 
+  return duration * 0.01715;
+}
+
+bool checkSideObstacle() {
+  float dist1 = GetDistance();
+  if (dist1 > 2.0 && dist1 <= 6.0) {
+    delay(30);
+    float dist2 = GetDistance();
+    if (dist2 > 2.0 && dist2 <= 6.0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ==========================================
+// 12. 底盘运动与定点转弯动作 (区分曲线和十字)
+// ==========================================
+void driveStraightOverNode() { runForward(); delay(200); }
+
+// --- 普通弯道专用---
+void alignAndTurnLeft_Curve()  { runForward(); delay(520); stopCar(); delay(100); turnLeft90_Curve(); }
+void alignAndTurnRight_Curve() { runForward(); delay(520); stopCar(); delay(100); turnRight90_Curve(); }
+
+void turnLeft90_Curve() {
+  analogWrite(ENA, speedTurn); analogWrite(ENB, speedTurn);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  
+  delay(200);
+  while (digitalRead(PIN_S3) == LOW) {} 
+  stopCar(); delay(200);
+}
+void turnRight90_Curve() {
+  analogWrite(ENA, speedTurn); analogWrite(ENB, speedTurn);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); 
+  delay(200); 
+  while (digitalRead(PIN_S2) == LOW) {} 
+  stopCar(); delay(200);
+}
+
+// --- 十字路口专用--- 
+void alignAndTurnLeft_Cross()  { runForward(); delay(1300); stopCar(); delay(100); turnLeft90_Cross(); }
+void alignAndTurnRight_Cross() { runForward(); delay(1300); stopCar(); delay(100); turnRight90_Cross(); }
+
+void turnLeft90_Cross() {
+  analogWrite(ENA, speedTurn); analogWrite(ENB, speedTurn);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH); digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  
+  delay(2800); // 盲转长
+  while (digitalRead(PIN_S3) == LOW) {} 
+  stopCar(); delay(200);
+}
+void turnRight90_Cross() {
+  analogWrite(ENA, speedTurn); analogWrite(ENB, speedTurn);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW); digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); 
+  delay(2800); // 盲转长
+  while (digitalRead(PIN_S2) == LOW) {} 
+  stopCar(); delay(200);
+}
+
+void alignAndTurnAround() { runForward(); delay(100); stopCar(); delay(100); turnAround180(); }
+
+void turnAround180() {
+  broadcastToPhone("🔄 [动作] 掉头...");
+  for (int i = 0; i < 6; i++) { executeWiggleStep(1500, 150); }
+  while (digitalRead(PIN_S3) == LOW) { executeWiggleStep(150, 60); }
+  broadcastToPhone("✅ [动作] 掉头成功");
+  stopCar(); delay(500);
+}
+
+void executeWiggleStep(int turnDelay, int forwardDelay) {
+  analogWrite(ENA, 200); analogWrite(ENB, 200);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH); 
+  delay(turnDelay); stopCar(); delay(100); 
+  runForward(); delay(forwardDelay); stopCar(); delay(100);
+}
+
+// ------------------------------------------
+// 基础电机控制
+// ------------------------------------------
+void runLineTrackingOnly() {
+  int S2 = digitalRead(PIN_S2);
+  int S3 = digitalRead(PIN_S3);
+  if (S2 == HIGH && S3 == LOW) { 
+    analogWrite(ENA, speedRun); analogWrite(ENB, speedRun);   
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);       
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  } else if (S3 == HIGH && S2 == LOW) { 
+    analogWrite(ENA, speedRun); analogWrite(ENB, speedRun);
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  } else {
+    runForward();
+  }
+}
+
+void runForward() {
+  analogWrite(ENA, speedRun); analogWrite(ENB, speedRun);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+}
+
+void runBackward() {
+  analogWrite(ENA, speedRun); analogWrite(ENB, speedRun);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+}
+
+void stopCar() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0); analogWrite(ENB, 0);
+}
